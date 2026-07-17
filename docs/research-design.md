@@ -1,204 +1,311 @@
-# Process-Set JEPA for Factory Acceptance APM
+# Action-Conditioned JEPA for Semantic and Process Auditing
 
 ## 1. Research decision
 
-This study targets image-only, module-level automatic progress monitoring (APM) from cumulative factory acceptance evidence.
+This study audits whether a factory acceptance record is supported by its submitted visual evidence and by the previously verified process history of the same module.
 
-The first-stage method is a resource-constrained, JEPA-style latent predictive process model. It uses a frozen pretrained visual backbone and trains a hierarchical evidence-set encoder, future-latent predictor, and supervised APM head. The study does not initially claim a general world model.
+The primary task is not automatic progress reconstruction. The database `subsectionId` is treated as a claim to verify, not as hidden information to predict. Progress is a downstream ledger updated only after a record is accepted by the audit process.
 
-## 2. Evidence and scope
+The proposed method is an action-conditioned, JEPA-style latent predictive model. It combines multi-view visual evidence, verified event history, elapsed time, and an authoritative partial-order graph derived from the factory SOP.
 
-The current inventory identifies:
+## 2. Practical motivation and evidence boundary
+
+The current data inventory identifies:
 
 - 692 candidate modules;
 - 8 shared subsections: `12.10`, `12.11`, `12.13`, `13.1`, `13.2`, `13.4`, `14.1`, and `16.1`;
 - 23,747 image segments, with at least 10 images per selected module-procedure pair;
 - complete `createTime` coverage.
 
-The accepted data assumptions are:
+The records are assumed to be mostly clean: most accepted records pair the correct subsection with relevant images, while a small unknown fraction may contain errors.
 
-- `createTime` reflects the true capture/acceptance order;
-- the eight subsections form a partial order rather than a fixed chain;
-- a recorded acceptance event means that the corresponding procedure was completed and accepted;
-- inference receives images and relative time only, never `subsectionId`;
-- evaluation holds out complete `moduleId` values within the same project/factory domain.
-
-These assumptions must be checked in the trajectory audit before model training.
+No expert-verified anomaly corpus is currently available. Therefore, the first study evaluates controlled semantic and process corruptions applied to real acceptance records. It does not establish real-world anomaly prevalence, fraud detection, or industrial audit performance.
 
 ## 3. Task definition
 
-For module \(m\), sort accepted inspection events by time:
+For the \(k\)-th submitted acceptance record of module \(m\), define:
 
 \[
-E_m = \{e_1, e_2, \ldots, e_K\},
-\qquad
-e_k = (\text{images}_k, \text{time}_k).
+\mathcal{R}_k =
+(a_k, X_k, H_{k-1}, \Delta t_k, G),
 \]
 
-At snapshot \(k\):
+where:
 
-- input: all accepted images observed through event \(e_k\), grouped by event and accompanied by relative times;
-- output: an eight-dimensional completion-probability vector;
-- auxiliary target: the latent representation of the next accepted event \(e_{k+1}\).
+- \(a_k\) is the record's claimed `subsectionId`;
+- \(X_k\) is the set of images submitted with the current record;
+- \(H_{k-1}\) is the sequence of previously verified events, times, procedures, and visual states;
+- \(\Delta t_k\) is the elapsed time since the previous verified event;
+- \(G\) is the authoritative partial-order graph.
 
-The main task is current cumulative progress-state estimation. Future prediction is an auxiliary representation-learning mechanism, not the deployment output.
+The model evaluates whether the current visual evidence supports the claimed procedure in the context of the module's verified history.
+
+### 3.1 Required outputs
+
+Each audit result uses a fixed structured schema:
+
+```json
+{
+  "inferred_procedure_distribution": {},
+  "claimed_subsection_compatibility": 0.0,
+  "evidence_decision": "supported|unsupported|insufficient",
+  "sequence_consistency": {
+    "legal": true,
+    "violated_preconditions": []
+  },
+  "expected_observed_latent_distance": 0.0,
+  "supporting_images": [],
+  "contradicting_images": [],
+  "confidence": 0.0
+}
+```
+
+The system produces an audit priority and evidence trace. It does not automatically accuse a record of fraud or replace the final human decision.
 
 ## 4. Data construction
 
-Split modules into train, validation, and test sets before generating snapshots. Use a deterministic, prefix-stratified 70/15/15 split so that every image and snapshot from one module remains in one partition.
+Split complete `moduleId` values into deterministic, prefix-stratified train, validation, and test partitions before constructing events or corruptions. Use a 70/15/15 split unless the trajectory audit shows that a different allocation is required for per-procedure coverage.
 
 For each `moduleId × subsectionId`:
 
-1. Inspect timestamp dispersion and record identifiers.
-2. Group records into acceptance events using the database's acceptance identifier when available; otherwise select a temporal clustering threshold from the training-set within-event and between-event gap distribution, then freeze it before validation and test construction.
-3. Exclude records that cannot be verified as accepted.
-4. Deduplicate exact files and near-duplicate images.
-5. Assign the event time from the verified acceptance timestamp, or the latest timestamp in the accepted cluster when only image times exist.
+1. Verify that the record represents an accepted event.
+2. Inspect timestamp dispersion and available event identifiers.
+3. Group images by the database event identifier when available.
+4. If event identifiers are unavailable, estimate a clustering threshold from training-set time-gap distributions and freeze it before constructing validation and test data.
+5. Deduplicate exact files within an event while preserving duplicate counts for later data-quality analysis.
+6. Order events using the verified acceptance time, or the latest image timestamp when no separate acceptance time exists.
 
-Generate one snapshot after each accepted event. Require at least one future event for JEPA training; retain terminal snapshots for APM-only training and evaluation.
-
-To control evidence-count shortcuts:
-
-- sample at most four images per event during training;
-- use deterministic four-image sampling per event for validation and testing;
-- report a separate all-images sensitivity analysis;
-- retain event boundaries instead of flattening all images.
+The trajectory audit must compare empirical event order with the authoritative SOP graph. Frequent but SOP-legal alternative orders remain valid; observed orders must not be used to redefine normative legality.
 
 ## 5. Model architecture
 
-### 5.1 Frozen image encoder
+### 5.1 Frozen visual backbone
 
-Precompute image embeddings with a frozen DINOv2-S or similarly sized pretrained ViT. Use CLIP as an optional backbone sensitivity check. Frozen embeddings make the first-stage experiment feasible on an RTX 3060 with 12 GB VRAM.
+Use a frozen, compact pretrained ViT such as DINOv2-S to produce per-image embeddings. Precompute embeddings offline so the first-stage experiment is feasible on an RTX 3060 with 12 GB VRAM.
 
-### 5.2 Hierarchical process-set encoder
+CLIP may be evaluated as a backbone sensitivity check. End-to-end visual fine-tuning is reserved for a later stage after the predictive mechanism passes its claim gate.
 
-The process-set encoder has two levels:
+### 5.2 Multi-view evidence encoder
 
-1. Event pooling aggregates the sampled image embeddings within one acceptance event.
-2. Temporal attention aggregates event representations up to snapshot \(k\), using relative-time embeddings and event positions.
-
-It outputs current module state \(z_k\). It receives no procedure identifiers.
-
-### 5.3 Target branch and predictor
-
-An exponential-moving-average target projector encodes the next event as stop-gradient target \(\bar z_{k+1}\). A predictor estimates:
+An event set encoder aggregates the variable-size image set \(X_k\):
 
 \[
-\hat z_{k+1} = p(z_k, \Delta t).
+z_k = E_{\mathrm{set}}(X_k).
 \]
 
-The first experiment uses one-step deterministic prediction. Multi-hypothesis prediction is introduced only if errors show systematic latent averaging at valid process branches.
+The encoder must preserve per-image representations for evidence attribution. Training uses random view subsampling and subset consistency so that the event representation does not depend on one fixed image count or ordering.
 
-### 5.4 APM head and process constraint
+### 5.3 History encoder
 
-A multi-label head predicts:
+A temporal set or transformer encoder represents the previously verified history:
 
 \[
-\hat y_k = h(z_k) \in [0,1]^8.
+h_{k-1} = E_{\mathrm{history}}(H_{k-1}).
 \]
 
-A fixed expert-validated partial-order graph penalizes predictions in which a successor is complete while a required predecessor is incomplete. The graph is a process prior, not image metadata.
+Each historical event includes its visual event latent, accepted procedure, relative time, and position. The current record is excluded from history.
+
+### 5.4 Action-conditioned latent predictor
+
+The predictor receives the verified history, current claimed procedure, elapsed time, and graph-derived procedure representation:
+
+\[
+\hat z_k =
+P(h_{k-1}, a_k, \Delta t_k, G).
+\]
+
+An exponential-moving-average target branch produces the stop-gradient observed target \(z_k\). The audit nonconformity includes:
+
+\[
+d_k =
+1-\cos(\hat z_k,z_k).
+\]
+
+This is a predicted post-action evidence state: it predicts what visual evidence should be observed after the claimed procedure, conditional on the previous verified state.
+
+### 5.5 Independent semantic verifier
+
+A procedure head predicts a distribution directly from the current evidence:
+
+\[
+p_k = C(z_k).
+\]
+
+The probability assigned to \(a_k\), the distribution entropy, and the disagreement between \(p_k\) and \(a_k\) provide semantic compatibility evidence independent of process history.
+
+### 5.6 Deterministic process verifier
+
+The SOP graph checks whether \(a_k\) is legal given the previously verified procedures. Sequence legality and violated preconditions are deterministic rule outputs, not claimed as learned neural reasoning.
+
+### 5.7 Selective audit and evidence attribution
+
+The audit decision combines calibrated semantic nonconformity, latent prediction error, cross-view disagreement, and process legality.
+
+Calibration primarily uses the clean validation distribution. The model returns `insufficient` when uncertainty or cross-view disagreement exceeds the selected clean-validation threshold.
+
+Supporting and contradicting images are identified through leave-one-image-out score changes. Raw attention weights are not treated as explanations.
 
 ## 6. Training objective
 
+Train primarily on original, mostly-clean records:
+
 \[
 L =
-L_{\mathrm{APM}}
-+ \lambda_{\mathrm{future}} L_{\mathrm{JEPA}}
-+ \lambda_{\mathrm{graph}} L_{\mathrm{violation}}.
+L_{\mathrm{procedure}}
++ \lambda_{\mathrm{JEPA}}L_{\mathrm{latent}}
++ \lambda_{\mathrm{subset}}L_{\mathrm{view\text{-}consistency}}.
 \]
 
-- \(L_{\mathrm{APM}}\): class-balanced binary cross-entropy over the eight completion labels.
-- \(L_{\mathrm{JEPA}}\): cosine distance between L2-normalized predicted and target future latent.
-- \(L_{\mathrm{violation}}\): differentiable penalty over expert-defined predecessor-successor constraints.
+- \(L_{\mathrm{procedure}}\): class-balanced cross-entropy for the accepted subsection.
+- \(L_{\mathrm{latent}}\): cosine distance between predicted and stop-gradient observed event latents.
+- \(L_{\mathrm{view\text{-}consistency}}\): consistency between embeddings and predictions from different subsets of the same event's images.
 
-Tune the two loss weights on validation macro-F1, with graph violation rate as a secondary selection criterion. The test set is evaluated once after configuration selection.
+Use robust loss trimming or bounded sample weights for the highest-loss training records to reduce sensitivity to a small unknown fraction of incorrect accepted records. Report the trimming rate and include a no-trimming ablation.
 
-## 7. Comparisons
+The primary setting does not train a binary classifier on synthetic corruptions. A secondary supervised-corruption setting may be reported separately, but it cannot replace the normal-only evaluation.
 
-All methods use the same split and snapshot manifest:
+## 7. Controlled audit benchmark
 
-1. Non-visual baseline using elapsed time, event count, and image count.
-2. Static frozen-DINOv2 baseline using mean pooling over all observed image embeddings and an MLP completion head.
-3. Supervised hierarchical set encoder with \(\lambda_{\mathrm{future}}=0\).
-4. Full Process-Set JEPA.
-5. Optional CLIP-backbone version to test backbone dependence.
+Keep each clean test record and generate paired corrupted variants only after module-level splitting.
 
-The key comparison is method 4 versus method 3. Architecture, optimizer, sampling, and APM supervision must otherwise remain identical. Target-domain I-JEPA visual pretraining is reserved for the larger-compute second stage and is not required for the first-stage claim.
+### 7.1 Graph-illegal claim swap
 
-## 8. Ablations
+Replace \(a_k\) with a subsection that violates an SOP predecessor constraint. This tests deterministic graph verification and is not sufficient to demonstrate JEPA value.
+
+### 7.2 Graph-legal semantic claim swap
+
+Replace \(a_k\) with a different subsection that remains legal under the same history but is inconsistent with \(X_k\). This is the primary semantic audit test because an SOP-only baseline cannot detect it.
+
+### 7.3 History corruption
+
+Remove a required historical event or perturb history while retaining the current record. This tests whether the process predictor uses the verified trajectory rather than only the claimed procedure.
+
+### 7.4 Controlled evidence insufficiency
+
+Progressively remove images or retain only highly similar views. This measures whether uncertainty increases as controlled visual evidence is reduced. It does not establish real-world evidence sufficiency without expert annotations.
+
+Cross-module image replacement, duplicate reuse, local manipulation, and forgery detection are excluded from the first study because they require provenance or forensic mechanisms distinct from semantic and process auditing.
+
+## 8. Baselines
+
+All methods use the same module split, event manifest, corruption manifest, and frozen visual backbone:
+
+1. SOP graph only.
+2. Multi-view procedure classifier only.
+3. Procedure classifier plus SOP graph.
+4. History encoder without latent prediction.
+5. Full action-conditioned JEPA auditor.
+6. Optional structured VLM auditor using the same images, claim, history summary, and SOP description.
+
+The key comparison is the full model against classifier plus SOP on graph-legal semantic corruptions.
+
+## 9. Required ablations
 
 Run:
 
-- no future loss;
-- future targets shuffled within each module;
-- relative-time input removed;
-- process-graph penalty removed;
-- true future target replaced by another module's target from the same procedure;
-- single-image input instead of cumulative evidence;
-- event boundaries removed and all images pooled as one flat set.
+- remove the JEPA latent objective and predictor;
+- remove history from the predictor;
+- shuffle history between modules;
+- shuffle claimed procedure tokens;
+- remove elapsed time;
+- remove graph-derived representations from the learned predictor while retaining the deterministic legality checker;
+- replace the target with another module's event from the same subsection;
+- remove subset-consistency training;
+- remove robust loss trimming.
 
-The shuffled-future ablation tests whether temporal structure matters. The cross-module same-procedure ablation separates generic procedure prototypes from module-specific evolution.
+If the full model retains the same performance after history shuffling, it has not demonstrated process-conditioned evidence prediction.
 
-## 9. Evaluation
+## 10. Evaluation
 
-Report:
+### 10.1 Procedure semantics
 
-- macro-F1 and per-procedure F1;
-- per-procedure AUROC where both classes are present;
-- completion-vector exact match;
-- Hamming loss;
-- temporal monotonicity violation rate;
-- partial-order violation rate;
-- Brier score and expected calibration error;
-- performance as a function of observed evidence fraction.
+- macro-F1;
+- per-procedure precision, recall, and F1;
+- expected calibration error;
+- confusion matrix.
 
-Use module-level bootstrap resampling for 95% confidence intervals. Compare paired module-level scores with a permutation test. Report results by module prefix and evidence volume as failure-analysis strata, without claiming cross-project generalization.
+### 10.2 Audit compatibility
 
-## 10. Stop/go gates
+Report separately for every corruption type:
+
+- AUROC;
+- AUPRC;
+- FPR at 95% TPR;
+- clean false-alarm rate;
+- paired clean-versus-corrupted effect size.
+
+### 10.3 Selective prediction
+
+- risk-coverage curve;
+- area under the risk-coverage curve;
+- coverage at fixed accepted risk;
+- uncertainty trend under progressive evidence removal.
+
+### 10.4 Explanation faithfulness
+
+Measure the change in compatibility after removing images identified as supporting or contradicting. Do not claim human-interpretable localization without expert explanation labels.
+
+### 10.5 Statistical protocol
+
+Use module-level bootstrap resampling for 95% confidence intervals and paired permutation tests for method comparisons. Begin with clean oracle history. Report closed-loop history as a separate stress test so error propagation is not hidden.
+
+## 11. Claim gates
 
 ### Data gate
 
-Proceed only if most selected modules form credible acceptance trajectories and timestamp ordering agrees sufficiently with the expert partial-order graph. Otherwise redefine the task around observed inspection evidence rather than true completion.
+Proceed only if accepted records form credible module trajectories and the authoritative graph covers the selected procedures.
 
-### Visual-information gate
+### Semantic gate
 
-Proceed to JEPA claims only if the supervised visual set encoder outperforms the non-visual time/count baseline on held-out modules.
+The multi-view classifier must distinguish selected procedures on held-out modules with per-class performance reported. Otherwise claimed-subsection compatibility is not established.
 
 ### Predictive-mechanism gate
 
-Claim process-dynamics benefit only if full Process-Set JEPA:
+The full model must:
 
-- outperforms the identical no-future-loss model with module-level uncertainty reported; and
-- performs better with true future targets than with shuffled future targets.
+- outperform classifier plus SOP on graph-legal semantic corruptions;
+- lose a measurable advantage when history is shuffled or removed;
+- maintain a controlled false-alarm rate on clean test records.
 
-If either condition fails, report future latent prediction as not demonstrated to improve APM and remove the world-model narrative.
+If these conditions fail, latent prediction has not demonstrated added audit value beyond static semantic classification and deterministic rules.
 
-## 11. Claim boundaries
+### Selective-audit gate
 
-Claims allowed when supported:
+Uncertainty must increase and coverage must decrease predictably under controlled evidence removal. Otherwise `insufficient` is not a validated output.
 
-- a hierarchical evidence-set model for sparse, asynchronous, multi-view acceptance trajectories;
-- image-only cumulative progress estimation on held-out modules from the same project/factory domain;
-- future latent prediction contributes process information, but only after passing the predictive-mechanism gate;
-- graph constraints reduce invalid process-state combinations, if confirmed by ablation.
+## 12. Claim boundaries
+
+Claims allowed when directly supported:
+
+- a controlled benchmark for semantic and process corruption of real factory acceptance records;
+- a multi-view, history-conditioned method for testing whether evidence supports a claimed subsection;
+- improved detection of graph-legal semantic corruption, if the predictive-mechanism gate passes;
+- calibrated abstention under controlled evidence removal, if the selective-audit gate passes;
+- deterministic SOP-based detection of illegal procedure claims.
 
 Claims not allowed in the first-stage study:
 
-- zero-shot inference;
-- general factory inspection auditing;
-- a general physical world model;
-- causal understanding of construction actions;
+- detection of real fraud, forgery, or malicious manipulation;
+- estimates of real anomaly prevalence;
+- industrial audit readiness;
+- complete automatic progress monitoring;
 - cross-project generalization;
-- industrial deployment readiness.
+- causal understanding of construction actions;
+- a general physical world model.
 
-## 12. Resource-aware progression
+## 13. Resource-aware progression
 
-Stage 1 uses offline frozen embeddings and a compact trainable process model on the local 12 GB GPU. Stage 2 fine-tunes the last visual blocks or a parameter-efficient adapter only after all three gates pass and larger compute is available. Stage 3 adds multi-step latent rollout and audit inconsistency detection only after one-step prediction is validated.
+Stage 1 uses frozen offline image embeddings and compact event, history, and predictor networks on the local 12 GB GPU.
 
-## 13. Literature anchors
+Stage 2 fine-tunes the last visual blocks or parameter-efficient adapters only after the semantic and predictive gates pass.
 
-- Assran et al., “Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture,” CVPR 2023: static masked latent prediction for semantic image representation.
+Stage 3 requires an expert-verified natural anomaly set before making real-world auditing claims. Duplicate reuse and image manipulation should be developed as separate forensic modules rather than added to the semantic JEPA model.
+
+## 14. Literature anchors
+
+- Assran et al., “Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture,” CVPR 2023: static latent prediction for semantic visual representation.
 - Assran et al., “V-JEPA 2: Self-Supervised Video Models Enable Understanding, Prediction and Planning,” arXiv:2506.09985, 2025 preprint: video JEPA and frozen-encoder action-conditioned latent prediction.
+- Martínez et al., “A vision-based approach for automatic progress tracking of floor paneling in offsite construction facilities,” *Automation in Construction*, 2021: evidence that visual monitoring is an established offsite-construction problem.
+- Panahi et al., “Automated Progress Monitoring in Modular Construction Factories Using Computer Vision and Building Information Modeling,” ISARC 2023: factory validation and practical limitations involving occlusion and manual setup.
 
-These works motivate the architecture but do not establish effectiveness for modular-construction APM. That effectiveness remains the hypothesis tested by this design.
+These works motivate visual process monitoring and latent prediction. They do not establish semantic/process auditing of factory acceptance records; that remains the hypothesis evaluated by this design.
